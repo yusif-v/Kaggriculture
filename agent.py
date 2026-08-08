@@ -1,48 +1,59 @@
 #!/usr/bin/env python3
 """Kaggriculture agent — repo: Kaggriculture.
 
-CERES strategy v3: hired farm hands + high-value diverse crops + land
-expansion, on top of the v2 goose.
+CERES strategy v4: v3's 5-hand crop engine PLUS a 3-animal herd (goose + cow +
+sheep) handled by an explicit FARMER state machine. Target: >= $25,000 local
+self-play (user's gate).
 
-Why v3 looks like this (rival forensics from v1/v2 ladder games):
-  * Opponents that beat us 4-5x did it with HIRED HANDS (5-12/day) and
-    high-value crops (melon $250, strawberry $120, tomato $60) — often with
-    NO land expansion (jps stayed in one quadrant and still won 4x). Hired
-    hands are the single biggest lever, because watering is the binding
-    constraint: every plant must be watered daily or it weeds, and one farmer
-    can only water ~6 tiles/day. More units = more watered tiles = more yield.
-  * So v3's core change is a MULTI-UNIT scheduler: the farmer + each hired
-    hand is assigned the nearest unserved tile task each turn (water >
-    harvest > plant > animal service). The action schema supports it:
-    {"farmer": [...], "hands": [[...], ...], "market": [...]}.
+Why animals are the only path to a big jump (rival forensics, all 17 ladder
+games): every bot that crushed us ran 12-16 hands AND animals (Daniel Wu
+100,093, Mason 79,979, JTHEFROG 12,590). v3 had 5 hands + 1 goose only. Raw
+hand-count alone is saturated (v3's 5 hands ~= 8 hands; 12 hands bled cash on
+fib hire cost ~$376/day and collapsed to ~$1.6k). Animal products are
+price-resilient (WOOL above_target 3.20 / $200 base, MILK 1.60 / $160, EGG
+0.20 / $50) vs crops that glut.
 
-Mechanics verified against kaggriculture.py:
-  * HIRE is a market order; the hand appears NEXT turn at a shed-adjacent
-    tile and persists for the rest of the day. Cost = fib(n) per hire that
-    day (1,1,2,3,5,8,...). So hands_actions length must equal
-    len(farm["hands"]) THIS turn, not the number we just hired.
-  * BUY_LAND unlocks NE ($1k) -> SW ($2k) -> SE ($4k).
-  * FEED/CARE/HARVEST on the goose need the unit standing on the coop; FEED
-    needs WHEAT in that unit's inventory (PICKUP from the shed first). The
-    coop sits on the spawn tile (4,4), which is shed-adjacent, so PICKUP works.
-  * One farmer/hand action per turn. Stateless across turns.
+The v4 failure mode in earlier attempts: feeding needs a unit WITH WHEAT
+standing on the animal tile, but a shared greedy scheduler split "PICKUP wheat
+at coop" from "FEED at animal" across different units, so neither completed and
+animals starved. Fix = the FARMER runs a deterministic per-turn state machine
+for all 3 animals (it spawns on the coop (4,4) daily, adjacent to every animal
+tile), and only falls back to crop work when no animal needs it. Hands never
+touch animals, so there is no task conflict.
+
+Mechanics (verified against kaggriculture.py):
+  * HIRE -> hand appears NEXT turn; hands_actions length == len(farm["hands"]).
+  * Shed-access tiles = (4,4),(5,4),(4,5),(5,5); only (4,4) is NW (unlocked day
+    1). PICKUP works only there. Pastures on NW-adjacent (3,4)/(4,3).
+  * FEED consumes 1 WHEAT from the UNIT's inventory. Escape after 2 consecutive
+    unfed days => lost animal, so feeding is the top priority every turn.
+  * HARVEST on an animal tile collects product (egg/milk/wool) to inventory;
+    end-of-day it lands in the shed and is sold. WHEAT is feed stock only.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
 
-# Plant priority: highest-value first. Diversifying avoids a single-product
-# price glut (carrot crashes hardest; melon/strawberry hold value better).
 CROP_PRIORITY = ["MELON", "STRAWBERRY", "TOMATO", "CARROT"]
-SELLABLE = {
-    "WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON",
-    "EGG", "MILK", "WOOL", "FERTILIZER",
-}
+SELLABLE = {"CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER"}
 MAX_MARKET_ORDERS = 10
 SEED_COST = {"WHEAT": 10, "CARROT": 20, "TOMATO": 50, "STRAWBERRY": 100, "MELON": 80}
-GOOSE_COST = 300
-MAX_HANDS = 5            # cap daily hires (fib: 1+1+2+3+5 = 12/day at 5 hands)
+ANIMAL_COST = {"GOOSE": 300, "COW": 400, "SHEEP": 500}
+COOP: Tuple[int, int] = (4, 4)
+ANIMAL_TILES = {"GOOSE": (4, 4), "COW": (3, 4), "SHEEP": (4, 3)}
+# Crop yield windows (mirrors kaggriculture.py CROPS). The watering bonus window
+# for one-time crops is ceil(max_yield_day/2) .. max_yield_day; fertilizing there
+# doubles the per-day yield bonus.
+CROP_DATA = {
+    "WHEAT":      {"max_yield_day": 4,  "ongoing": False},
+    "CARROT":     {"max_yield_day": 3,  "ongoing": False},
+    "TOMATO":     {"max_yield_day": 8,  "ongoing": True},
+    "STRAWBERRY": {"max_yield_day": 10, "ongoing": True},
+    "MELON":      {"max_yield_day": 12, "ongoing": False},
+}
+
+MAX_HANDS = 8
+SAFE_PER_UNIT = 6
 HARVEST_AGE = {"WHEAT": 4, "CARROT": 3, "MELON": 10}
-COOP: Tuple[int, int] = (4, 4)   # coop on spawn so the farmer starts each day on it
 
 
 def _is_empty(tile: Any) -> bool:
@@ -82,35 +93,38 @@ def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
     hires_today = farm.get("hires_today", 0)
     unlocked = set(farm.get("unlocked_quadrants", ["NW"]))
 
-    # Current living plant count (used by capacity-driven hiring/land/seed logic).
     planted = 0
     for _row in tiles:
         for _t in _row:
             if isinstance(_t, dict) and _t.get("kind") == "PLANT":
                 planted += 1
 
+    present = {}
+    for kind, (ax, ay) in ANIMAL_TILES.items():
+        if 0 <= ay < board and 0 <= ax < board:
+            t = tiles[ay][ax]
+            if isinstance(t, dict) and t.get("animal") == kind:
+                present[kind] = t
+    num_animals = len(present)
+
     market_orders: List[List] = []
 
-    # ---- sell everything harvestable in the shed ----
+    # ---- sell harvestable; RESERVE wheat as feed (never sell the buffer) ----
+    wheat_buffer = num_animals * 2 + 4
     for item, qty in shed.items():
         if qty > 0 and item in SELLABLE and len(market_orders) < MAX_MARKET_ORDERS:
             market_orders.append(["SELL", item, int(qty)])
+    if shed.get("WHEAT", 0) > wheat_buffer and len(market_orders) < MAX_MARKET_ORDERS:
+        market_orders.append(["SELL", "WHEAT", int(shed["WHEAT"] - wheat_buffer)])
 
-    # ---- capacity: how many tiles our units can keep watered ----
-    # A unit tending a DENSE cluster waters ~6 tiles/day (short walks). Planting
-    # beyond capacity just creates weeds.
+    # ---- capacity + hired hands ----
     units = 1 + len(hands)
-    SAFE_PER_UNIT = 6
     capacity = units * SAFE_PER_UNIT
-
-    # ---- hire hands (primary lever): build the workforce early ----
-    # Rivals that win run 5-12 hands. Cost is fib (1,1,2,3,5 = 12/day at 5); cheap
-    # vs the yield. Hire every day up to MAX_HANDS while we can still afford seeds.
     if (hires_today < MAX_HANDS and money > 400
             and len(market_orders) < MAX_MARKET_ORDERS):
         market_orders.append(["HIRE"])
 
-    # ---- land expansion, only when the current land is basically full ----
+    # ---- land expansion when full ----
     land_order = ["NE", "SW", "SE"]
     land_prices = [1000, 2000, 4000]
     n_extra = len(unlocked) - 1
@@ -119,122 +133,137 @@ def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
             and len(market_orders) < MAX_MARKET_ORDERS):
         market_orders.append(["BUY_LAND"])
 
-    # ---- seed procurement, only up to planting headroom ----
-    # Headroom = capacity - planted (tiles we could responsibly plant). Buy a few
-    # seeds per priority crop, but never stockpile beyond what we can plant.
+    # ---- seeds up to headroom ----
     headroom = max(0, capacity - planted)
     for crop in CROP_PRIORITY:
         if (seeds.get(crop, 0) == 0 and headroom > 0 and money > SEED_COST[crop] + 100
                 and len(market_orders) < MAX_MARKET_ORDERS):
             market_orders.append(["BUY_SEED", crop, min(3, headroom)])
 
-    # ---- goose coop + a small wheat buffer for feeding ----
-    g = tiles[COOP[1]][COOP[0]] if (0 <= COOP[1] < board and 0 <= COOP[0] < board) else None
-    goose = isinstance(g, dict) and g.get("animal") == "GOOSE"
-    coop_built = isinstance(g, dict) and g.get("kind") == "COOP"
-    if not goose and money > GOOSE_COST and shed.get("GOOSE", 0) == 0 and len(market_orders) < MAX_MARKET_ORDERS:
-        market_orders.append(["BUY_ANIMAL", "GOOSE", 1])
-    if shed.get("WHEAT", 0) < 2 and money > 120 and len(market_orders) < MAX_MARKET_ORDERS:
-        market_orders.append(["BUY_PRODUCT", "WHEAT", 2])
+    # ---- animals: buy when affordable + not owned ----
+    for kind, cost in ANIMAL_COST.items():
+        if (kind not in present and money > cost + 200 and shed.get(kind, 0) == 0
+                and len(market_orders) < MAX_MARKET_ORDERS):
+            market_orders.append(["BUY_ANIMAL", kind, 1])
 
-    # ---- build the task list across all tiles ----
-    # task = dict(kind, x, y, crop?, needs_inv?)
-    tasks = []
+    # ---- wheat feed reserve ----
+    if shed.get("WHEAT", 0) < wheat_buffer and money > 120 and len(market_orders) < MAX_MARKET_ORDERS:
+        market_orders.append(["BUY_PRODUCT", "WHEAT", wheat_buffer - shed.get("WHEAT", 0)])
+
+    # ---------- FARMER ANIMAL STATE MACHINE ----------
+    # Returns an action if the farmer should do animal work this turn; else None.
+    def farmer_animal() -> Optional[List[str]]:
+        for kind, (ax, ay) in ANIMAL_TILES.items():
+            if not (0 <= ay < board and 0 <= ax < board):
+                continue
+            t = tiles[ay][ax]
+            if isinstance(t, dict) and t.get("animal") == kind:
+                # 1) feed (needs wheat in farmer inventory)
+                if not t.get("fed_today", True):
+                    if farmer_inv.get("WHEAT", 0) > 0:
+                        if (fx, fy) == (ax, ay):
+                            return ["FEED"]
+                        return [_move_toward(fx, fy, ax, ay)]
+                    else:
+                        if (fx, fy) == COOP:
+                            return ["PICKUP", "WHEAT", 1]
+                        return [_move_toward(fx, fy, COOP[0], COOP[1])]
+                # 2) care
+                if not t.get("cared_today", True):
+                    if (fx, fy) == (ax, ay):
+                        return ["CARE"]
+                    return [_move_toward(fx, fy, ax, ay)]
+                # 3) collect fertilizer when available (free yield later)
+                if t.get("fertilizer_available", False):
+                    if (fx, fy) == (ax, ay):
+                        return ["COLLECT_FERTILIZER"]
+                    return [_move_toward(fx, fy, ax, ay)]
+                # 4) collect product
+                if t.get("yield_units", 0) >= 1:
+                    if (fx, fy) == (ax, ay):
+                        return ["HARVEST"]
+                    return [_move_toward(fx, fy, ax, ay)]
+            elif isinstance(t, dict) and t.get("kind") in ("COOP", "PASTURE"):
+                # structure exists, place the animal
+                if shed.get(kind, 0) > 0 and farmer_inv.get(kind, 0) == 0:
+                    if (fx, fy) == COOP:
+                        return ["PICKUP", kind, 1]
+                    return [_move_toward(fx, fy, COOP[0], COOP[1])]
+                if farmer_inv.get(kind, 0) > 0:
+                    if (fx, fy) == (ax, ay):
+                        return ["PLACE", kind]
+                    return [_move_toward(fx, fy, ax, ay)]
+            elif _is_empty(t) and (fx, fy) == (ax, ay):
+                struct = "COOP" if kind == "GOOSE" else "PASTURE"
+                return ["BUILD_" + struct]
+        return None
+
+    # ---------- CROP TASKS (for farmer fallback + hands) ----------
+    crop_tasks: List[Dict[str, Any]] = []
     for y in range(board):
         for x in range(board):
             t = tiles[y][x]
-            if isinstance(t, dict) and t.get("animal") == "GOOSE" and (x, y) == COOP:
-                if not t.get("fed_today", True) and farmer_inv.get("WHEAT", 0) == 0 and shed.get("WHEAT", 0) > 0:
-                    tasks.append({"kind": "PICKUP_WHEAT", "x": x, "y": y})
-                elif not t.get("fed_today", True) and (farmer_inv.get("WHEAT", 0) > 0 or shed.get("WHEAT", 0) > 0):
-                    tasks.append({"kind": "FEED", "x": x, "y": y})
-                elif not t.get("cared_today", True):
-                    tasks.append({"kind": "CARE", "x": x, "y": y})
-                elif t.get("yield_units", 0) >= 2:
-                    tasks.append({"kind": "HARVEST_EGG", "x": x, "y": y})
-            elif isinstance(t, dict) and t.get("kind") == "PLANT":
+            if isinstance(t, dict) and t.get("kind") == "PLANT":
                 planted += 1
+                crop = t.get("crop")
                 age = day - t.get("planted_day", day)
-                if t.get("yield_units", 0) >= 1 and age >= HARVEST_AGE.get(t.get("crop"), 99):
-                    tasks.append({"kind": "HARVEST", "x": x, "y": y})
+                cd = CROP_DATA.get(crop, {})
+                myd = cd.get("max_yield_day", 99)
+                bonus_lo = (myd + 1) // 2
+                in_bonus = not cd.get("ongoing", False) and bonus_lo <= age <= myd
+                if t.get("yield_units", 0) >= 1 and age >= HARVEST_AGE.get(crop, 99):
+                    crop_tasks.append({"x": x, "y": y, "op": "HARVEST"})
+                elif in_bonus and not t.get("fertilized_until_day", -1) >= day:
+                    crop_tasks.append({"x": x, "y": y, "op": "FERTILIZE"})
                 elif not t.get("watered_today", True) and t.get("consecutive_unwatered", 0) < 2:
-                    tasks.append({"kind": "WATER", "x": x, "y": y})
+                    crop_tasks.append({"x": x, "y": y, "op": "WATER"})
             elif _is_empty(t):
-                # plant the highest-value crop we have a seed for, but only up to
-                # capacity (don't create weeds we can't water).
-                if planted < capacity and (x, y) != COOP:
+                if planted < capacity and (x, y) not in ANIMAL_TILES.values():
                     for crop in CROP_PRIORITY:
                         if seeds.get(crop, 0) > 0:
-                            tasks.append({"kind": "PLANT", "x": x, "y": y, "crop": crop})
+                            crop_tasks.append({"x": x, "y": y, "op": "PLANT", "crop": crop})
                             planted += 1
                             break
 
-    # Build/place goose coop counts as a task on the coop tile.
-    if not goose and not coop_built and (fx, fy) == COOP:
-        tasks.append({"kind": "BUILD_COOP", "x": COOP[0], "y": COOP[1]})
-    elif not goose and coop_built:
-        if shed.get("GOOSE", 0) > 0 and farmer_inv.get("GOOSE", 0) == 0:
-            tasks.append({"kind": "PICKUP_GOOSE", "x": COOP[0], "y": COOP[1]})
-        elif farmer_inv.get("GOOSE", 0) > 0:
-            tasks.append({"kind": "PLACE_GOOSE", "x": COOP[0], "y": COOP[1]})
+    def _crop_act(tk: Dict[str, Any], inv: Dict[str, int]) -> List[str]:
+        if tk["op"] == "HARVEST":
+            return ["HARVEST"]
+        if tk["op"] == "FERTILIZE":
+            return ["FERTILIZE"]
+        if tk["op"] == "PLANT":
+            return ["PLANT", tk["crop"]]
+        return ["WATER"]
 
-    claimed = set()  # (x,y) claimed by a task already
-
-    def _assign_unit(ux: int, uy: int, uinv: Dict[str, int]) -> List[str]:
-        """Greedy: act on the tile we're standing on, else walk to nearest task."""
-        # 1) Act in place.
-        here_task = None
-        for tk in tasks:
-            if (tk["x"], tk["y"]) == (ux, uy) and (tk["x"], tk["y"]) not in claimed:
-                here_task = tk
-                break
-        if here_task is not None:
-            claimed.add((ux, uy))
-            return _task_action(here_task, uinv)
-        # 2) Nearest unclaimed task.
+    def _assign_crop(ux: int, uy: int, inv: Dict[str, int]) -> List[str]:
+        # in-place
+        for tk in crop_tasks:
+            if (tk["x"], tk["y"]) == (ux, uy):
+                # only fertilize if this unit actually carries fertilizer
+                if tk["op"] == "FERTILIZE" and inv.get("FERTILIZER", 0) == 0:
+                    continue
+                return _crop_act(tk, inv)
+        # nearest
         best, best_d = None, 10 ** 9
-        for tk in tasks:
-            if (tk["x"], tk["y"]) in claimed:
+        for tk in crop_tasks:
+            if tk["op"] == "FERTILIZE" and inv.get("FERTILIZER", 0) == 0:
                 continue
             d = _manhattan(ux, uy, tk["x"], tk["y"])
             if d < best_d:
                 best_d, best = d, tk
         if best is None:
             return ["PASS"]
-        claimed.add((best["x"], best["y"]))
         if best_d == 0:
-            return _task_action(best, uinv)
+            return _crop_act(best, inv)
         return [_move_toward(ux, uy, best["x"], best["y"])]
 
-    def _task_action(tk: Dict[str, Any], uinv: Dict[str, int]) -> List[str]:
-        k = tk["kind"]
-        if k == "WATER":
-            return ["WATER"]
-        if k == "HARVEST":
-            return ["HARVEST"]
-        if k == "PLANT":
-            return ["PLANT", tk["crop"]]
-        if k == "BUILD_COOP":
-            return ["BUILD_COOP"]
-        if k == "PICKUP_GOOSE":
-            return ["PICKUP", "GOOSE", 1]
-        if k == "PLACE_GOOSE":
-            return ["PLACE", "GOOSE"]
-        if k == "PICKUP_WHEAT":
-            return ["PICKUP", "WHEAT", 1]
-        if k == "FEED":
-            return ["FEED"]
-        if k == "CARE":
-            return ["CARE"]
-        if k == "HARVEST_EGG":
-            return ["HARVEST"]
-        return ["PASS"]
+    # Farmer: animal work first, else crops.
+    farmer_action = farmer_animal()
+    if farmer_action is None:
+        farmer_action = _assign_crop(fx, fy, farmer_inv)
 
-    # ---- assign farmer + each hand ----
-    farmer_action = _assign_unit(fx, fy, farmer_inv)
     hands_actions: List[List[str]] = []
     for hidx, hp in enumerate(hands):
         hinv = inventories[hidx + 1] if hidx + 1 < len(inventories) else {}
-        hands_actions.append(_assign_unit(hp[0], hp[1], hinv))
+        hands_actions.append(_assign_crop(hp[0], hp[1], hinv))
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
