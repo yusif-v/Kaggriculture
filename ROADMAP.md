@@ -61,3 +61,20 @@ per-quadrant rewrite.
 Approve the v5 per-quadrant rewrite (multi-hour, may regress before it
 improves), or accept v4.1 (~$19k, 2.6x v3) as the shipped baseline and stop
 pursuing 25k.
+
+## v5 experiments (2026-08-08) — DEAD END at the tweak level
+
+Approved "v5" but the viable design (per-quadrant sub-farms with own animals) is a
+from-scratch rewrite. Tried two cheaper "free the farmer" variants first:
+
+1. Dedicated animal caretaker hand (hand 0 runs the v4.1 animal state machine,
+   farmer freed for crops): $311 mean. One hand cannot tend 3 animals as well as
+   the farmer did; animals underfed -> collapse.
+2. Fix seed-buy to fill headroom (the v4.1 under-planting bug) at cash buffers
+   $1200 / $600 / delayed-to-day12: $12.9k / $5.5k / $2.5k. Filling the crop farm
+   drains the cash that funds animals; crops are a net sink at 8 hands.
+
+CONCLUSION: v4.1's ~$19k is a HARD ceiling for the single-farmer-animal design.
+The only 25k route is the full per-quadrant rewrite (each quadrant: local hands +
+its own 1 animal + dense crops, farmer as roamer). Not yet attempted — high risk,
+needs building from scratch with the 25k gate guarding each step.
