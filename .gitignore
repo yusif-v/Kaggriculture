@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local artifacts
+obs_sample.json
+*.log
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
