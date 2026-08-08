@@ -47,11 +47,33 @@ Kaggle validation episode.
 
 ## Submit to Kaggle
 
-The agent is a single `agent.py` exposing `agent(obs) -> {"farmer":[...],"market":[...]}`.
-Upload via the competition Code tab (or `kaggle competitions submit` once the
-submission channel is open). Keep the file minimal — Kaggle imports `agent` and
-calls it each turn; do not rely on global state across turns (the harness may
-re-import per episode).
+The competition wants a `main.py` at the root that exports an `agent`
+function. Per the env AGENTS.md, a submission is a package tarball of
+`main.py` + `agent.py`. We keep the strategy in `agent.py` (single source of
+truth) and re-export it from `main.py`:
+
+```bash
+chmod +x submit.sh
+./submit.sh "CERES baseline v1: carrot monoculture 2x2"
+```
+
+`submit.sh` will:
+1. **Gate** on the local harness — `validate.py --short` and the full 720-turn
+   self-play must both PASS, else it aborts (never submit a bot that can't
+   survive the validation episode).
+2. Package `main.py agent.py README.md` into `submission.tar.gz`.
+3. Run `kaggle competitions submit kaggriculture -f submission.tar.gz -m "<msg>"`.
+
+Poll status after submitting:
+
+```bash
+kaggle competitions submissions kaggriculture
+```
+
+You must have **joined the competition** on the Kaggle website first (rules
+acceptance); the channel is open for the agent file (not a CSV). Kaggle imports
+`agent` and calls it each turn — keep it stateless (the harness may re-import
+per episode) and use stdlib-only imports at module scope.
 
 ## Roadmap (iteration order)
 
