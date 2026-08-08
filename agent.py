@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Kaggriculture agent — repo: Kaggriculture.
 
-CERES strategy v4: v3's 5-hand crop engine PLUS a 3-animal herd (goose + cow +
-sheep) handled by an explicit FARMER state machine. Target: >= $25,000 local
-self-play (user's gate).
+CERES strategy v4.1: v3's 5-hand crop engine PLUS a 3-animal herd (goose +
+cow + sheep) handled by an explicit FARMER state machine, with per-hand home
+quadrant soft-pinning. Local self-play mean ~$19k (~2.6x v3). Target $25k
+pursued in parallel (see shop-synergy / per-quadrant rewrite).
 
 Why animals are the only path to a big jump (rival forensics, all 17 ladder
 games): every bot that crushed us ran 12-16 hands AND animals (Daniel Wu
