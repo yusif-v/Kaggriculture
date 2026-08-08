@@ -76,6 +76,21 @@ def _manhattan(fx: int, fy: int, tx: int, ty: int) -> int:
     return abs(fx - tx) + abs(fy - ty)
 
 
+# v4.1: each hired hand is pinned to a HOME QUADRANT so plants stay local and
+# watering/harvest walks shrink (the top bots' effective play). Farmer stays NW.
+def _quad_of(x: int, y: int) -> str:
+    if x < 5 and y < 5:
+        return "NW"
+    if x >= 5 and y < 5:
+        return "NE"
+    if x < 5 and y >= 5:
+        return "SW"
+    return "SE"
+
+
+HOME_QUADS = ["NW", "NE", "SW", "SE"]
+
+
 def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
     p = obs["player"]
     farm = obs["farms"][p]
@@ -199,10 +214,12 @@ def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
         return None
 
     # ---------- CROP TASKS (for farmer fallback + hands) ----------
+    # v4.1: tag each plant task with its quadrant so hands only tend their home.
     crop_tasks: List[Dict[str, Any]] = []
     for y in range(board):
         for x in range(board):
             t = tiles[y][x]
+            q = _quad_of(x, y)
             if isinstance(t, dict) and t.get("kind") == "PLANT":
                 planted += 1
                 crop = t.get("crop")
@@ -212,16 +229,16 @@ def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
                 bonus_lo = (myd + 1) // 2
                 in_bonus = not cd.get("ongoing", False) and bonus_lo <= age <= myd
                 if t.get("yield_units", 0) >= 1 and age >= HARVEST_AGE.get(crop, 99):
-                    crop_tasks.append({"x": x, "y": y, "op": "HARVEST"})
+                    crop_tasks.append({"x": x, "y": y, "q": q, "op": "HARVEST"})
                 elif in_bonus and not t.get("fertilized_until_day", -1) >= day:
-                    crop_tasks.append({"x": x, "y": y, "op": "FERTILIZE"})
+                    crop_tasks.append({"x": x, "y": y, "q": q, "op": "FERTILIZE"})
                 elif not t.get("watered_today", True) and t.get("consecutive_unwatered", 0) < 2:
-                    crop_tasks.append({"x": x, "y": y, "op": "WATER"})
+                    crop_tasks.append({"x": x, "y": y, "q": q, "op": "WATER"})
             elif _is_empty(t):
                 if planted < capacity and (x, y) not in ANIMAL_TILES.values():
                     for crop in CROP_PRIORITY:
                         if seeds.get(crop, 0) > 0:
-                            crop_tasks.append({"x": x, "y": y, "op": "PLANT", "crop": crop})
+                            crop_tasks.append({"x": x, "y": y, "q": q, "op": "PLANT", "crop": crop})
                             planted += 1
                             break
 
@@ -234,36 +251,44 @@ def agent(obs: Dict[str, Any]) -> Dict[str, Any]:
             return ["PLANT", tk["crop"]]
         return ["WATER"]
 
-    def _assign_crop(ux: int, uy: int, inv: Dict[str, int]) -> List[str]:
-        # in-place
+    def _assign_crop(ux: int, uy: int, inv: Dict[str, int], home: str = "ANY") -> List[str]:
+        def _nearest(home_filter: str) -> Optional[Dict[str, Any]]:
+            best, best_d = None, 10 ** 9
+            for tk in crop_tasks:
+                if home_filter != "ANY" and tk["q"] != home_filter:
+                    continue
+                if tk["op"] == "FERTILIZE" and inv.get("FERTILIZER", 0) == 0:
+                    continue
+                d = _manhattan(ux, uy, tk["x"], tk["y"])
+                if d < best_d:
+                    best_d, best = d, tk
+            return best
+
+        # in-place (any quadrant)
         for tk in crop_tasks:
             if (tk["x"], tk["y"]) == (ux, uy):
-                # only fertilize if this unit actually carries fertilizer
                 if tk["op"] == "FERTILIZE" and inv.get("FERTILIZER", 0) == 0:
                     continue
                 return _crop_act(tk, inv)
-        # nearest
-        best, best_d = None, 10 ** 9
-        for tk in crop_tasks:
-            if tk["op"] == "FERTILIZE" and inv.get("FERTILIZER", 0) == 0:
-                continue
-            d = _manhattan(ux, uy, tk["x"], tk["y"])
-            if d < best_d:
-                best_d, best = d, tk
+        # nearest: prefer home quadrant, else fall back to any
+        best = _nearest(home) if home != "ANY" else None
+        if best is None:
+            best = _nearest("ANY")
         if best is None:
             return ["PASS"]
-        if best_d == 0:
+        if _manhattan(ux, uy, best["x"], best["y"]) == 0:
             return _crop_act(best, inv)
         return [_move_toward(ux, uy, best["x"], best["y"])]
 
-    # Farmer: animal work first, else crops.
+    # Farmer: animal work first, else crops (NW only).
     farmer_action = farmer_animal()
     if farmer_action is None:
-        farmer_action = _assign_crop(fx, fy, farmer_inv)
+        farmer_action = _assign_crop(fx, fy, farmer_inv, home="NW")
 
     hands_actions: List[List[str]] = []
     for hidx, hp in enumerate(hands):
         hinv = inventories[hidx + 1] if hidx + 1 < len(inventories) else {}
-        hands_actions.append(_assign_crop(hp[0], hp[1], hinv))
+        home = HOME_QUADS[hidx % 4]
+        hands_actions.append(_assign_crop(hp[0], hp[1], hinv, home=home))
 
     return {"farmer": farmer_action, "hands": hands_actions, "market": market_orders}
